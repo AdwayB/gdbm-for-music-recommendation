@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "gdbm-for-music-recommendation"
+version = "0.1.0"
+description = ""
+authors = ["AdwayB <adwaybyju@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+uuid = "^1.30"
+scikit-learn = "^1.5.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
