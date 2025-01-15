@@ -3,6 +3,10 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.special import expit
 
+pd.set_option('display.max_columns', None)
+# pd.set_option('display.max_rows', None)
+pd.set_option('display.width', None)
+
 def activation_function(x):
   # return np.tanh(x)
   # return 1 / (1 + np.exp(-x))
@@ -93,11 +97,34 @@ class RBM:
 
 
 class DBM:
+  """
+      A multi-layer DBM. Each 'RBM' in self.rbms connects layer i (bottom) to layer i+1 (top).
+      For example, if layer_sizes = [nV, nH1, nH2], then:
+        self.rbms[0] connects V <-> H1
+        self.rbms[1] connects H1 <-> H2
+      Implements:
+        - Full mean-field inference (up–down) with top-down influences
+        - Full block Gibbs sampling (down–up) with each layer being sampled
+      """
   def __init__(self, layer_sizes):
     self.rbms = []
     for i in range(len(layer_sizes) - 1):
       rbm = RBM(layer_sizes[i], layer_sizes[i + 1])
       self.rbms.append(rbm)
+
+    self.adam_buffers = []
+    for rbm in self.rbms:
+      buffer_dict = {
+        'v_w': np.zeros_like(rbm.weights),
+        's_w': np.zeros_like(rbm.weights),
+        'v_vb': np.zeros_like(rbm.visible_bias),
+        's_vb': np.zeros_like(rbm.visible_bias),
+        'v_hb': np.zeros_like(rbm.hidden_bias),
+        's_hb': np.zeros_like(rbm.hidden_bias),
+        'v_log_sigma': np.zeros_like(rbm.log_sigma_squared),
+        's_log_sigma': np.zeros_like(rbm.log_sigma_squared),
+      }
+      self.adam_buffers.append(buffer_dict)
 
   def pretrain_layers(self, data, learning_rate=0.01, epochs=10, batch_size=100, weight_decay=0.0001):
     input_data = data
@@ -106,55 +133,187 @@ class DBM:
       rbm.train(input_data, learning_rate, epochs, batch_size, weight_decay)
       input_data, _ = rbm.sample_hidden(input_data)
 
-  def finetune(self, data, learning_rate=0.01, epochs=10, batch_size=100):
+  def mean_field_inference(self, visible_data, num_iters=5):
+    """
+    A parallel mean-field inference for the entire DBM.
+     - At each iteration, every hidden layer i is updated in parallel
+       using the previous iteration's states for neighbors.
+
+    Returns a list of arrays: [h1_mean, h2_mean, ..., hN_mean].
+    """
+    n_layers = len(self.rbms)
+    batch_size = visible_data.shape[0]
+
+    hidden_means = [0.5 * np.ones((batch_size, rbm.n_hidden))
+                    for rbm in self.rbms]
+
+    # For Gaussian bottom RBM
+    bottom_rbm = self.rbms[0]
+    sigma_squared = np.exp(bottom_rbm.log_sigma_squared)
+
+    for _ in range(num_iters):
+      old_means = [hm.copy() for hm in hidden_means]
+
+      for i, rbm in enumerate(self.rbms):
+        # Bottom-up contribution
+        if i == 0:
+          # This hidden layer sees the visible data (Gaussian) plus top-down from layer i+1
+          pre_act = np.dot(visible_data / sigma_squared, rbm.weights) + rbm.hidden_bias
+        else:
+          # Middle or top hidden sees hidden_means[i-1]
+          pre_act = np.dot(old_means[i - 1], rbm.weights) + rbm.hidden_bias
+
+        # Top-down contribution
+        if i < n_layers - 1:
+          top_rbm = self.rbms[i + 1]
+          pre_act += np.dot(old_means[i + 1], top_rbm.weights.T)
+
+        hidden_means[i] = activation_function(pre_act)
+
+    return hidden_means
+
+  def block_gibbs_sampling(self, hidden_init_list, k=5):
+    """
+    A parallel block Gibbs sampler for the negative phase in a DBM.
+     - In each sub-step:
+        1) Re-sample all hidden layers *in parallel* (each sees neighbors from old state).
+        2) Re-sample the visible from the bottom hidden.
+
+    hidden_init_list: initial hidden states [h1, h2, ...] (e.g., from mean field).
+    Returns (v_neg, hidden_states), where
+      v_neg is the final visible sample,
+      hidden_states = [h1_neg, h2_neg, ...].
+    """
+    n_layers = len(self.rbms)
+    hidden_states = [h.copy() for h in hidden_init_list]
+
+    bottom_rbm = self.rbms[0]
+    sigma_squared = np.exp(bottom_rbm.log_sigma_squared)
+    v_neg = bottom_rbm.sample_visible(hidden_states[0])
+
+    for _ in range(k):
+      old_hidden = [hs.copy() for hs in hidden_states]
+
+      # Re-sample each hidden layer in parallel
+      for i, rbm in enumerate(self.rbms):
+        # bottom-up contribution
+        if i == 0:
+          pre_act = np.dot(v_neg / sigma_squared, rbm.weights) + rbm.hidden_bias
+        else:
+          pre_act = np.dot(old_hidden[i - 1], rbm.weights) + rbm.hidden_bias
+
+        # top-down contribution
+        if i < n_layers - 1:
+          top_rbm = self.rbms[i + 1]
+          pre_act += np.dot(old_hidden[i + 1], top_rbm.weights.T)
+
+        # Stochastic sampling of hidden units
+        probs = activation_function(pre_act)
+        hidden_states[i] = (np.random.rand(*probs.shape) < probs).astype(float)
+
+      # Re-sample visible from the bottom hidden
+      v_neg = bottom_rbm.sample_visible(hidden_states[0])
+
+    return v_neg, hidden_states
+
+  def finetune(self, data, learning_rate=0.001, epochs=10, batch_size=100,
+               mean_field_iters=5, gibbs_k=5, max_grad=3.0, weight_decay=0.0001, beta1=0.9, beta2=0.999, epsilon=1e-8):
+    """
+    Full DBM fine-tuning with:
+      1) Mean-field inference (with up–down sweeps) => positive phase
+      2) Block Gibbs sampling (with down–up passes) => negative phase
+      3) Parameter updates using difference of associations, plus optional weight decay
+    """
     num_examples = data.shape[0]
+    t = 0
+
     for epoch in range(epochs):
       np.random.shuffle(data)
       batch_errors = []
-      for i in range(0, num_examples, batch_size):
-        batch = data[i:i + batch_size]
 
-        activations = [batch]
-        v = batch
-        for rbm in self.rbms:
-          h_mean, h_sample = rbm.sample_hidden(v)
-          activations.append(h_mean)
-          v = h_mean
+      for start_idx in range(0, num_examples, batch_size):
+        t += 1
+        batch = data[start_idx:start_idx + batch_size]
+        bsz = batch.shape[0]
 
-        v = activations[-1]
-        for idx in reversed(range(len(self.rbms))):
-          rbm = self.rbms[idx]
-          v = rbm.sample_visible(v)
-          h_mean_neg, h_sample_neg = rbm.sample_hidden(v)
+        # Positive Phase
+        hidden_means = self.mean_field_inference(batch, num_iters=mean_field_iters)
 
-          v_pos = activations[idx]
-          h_pos = activations[idx + 1]
+        # Negative Phase
+        v_neg, hidden_states_neg = self.block_gibbs_sampling(hidden_means, k=gibbs_k)
 
+        for i, rbm in enumerate(self.rbms):
           sigma_squared = np.exp(rbm.log_sigma_squared)
 
-          pos_associations = np.dot((v_pos / sigma_squared).T, h_pos)
-          neg_associations = np.dot((v / sigma_squared).T, h_mean_neg)
+          if i == 0:
+            pos_assoc = np.dot((batch / sigma_squared).T, hidden_means[0]) / bsz
+            neg_assoc = np.dot((v_neg / sigma_squared).T, hidden_states_neg[0]) / bsz
+            grad_w = pos_assoc - neg_assoc - weight_decay * rbm.weights
+            grad_vb = (
+                np.mean(batch / sigma_squared, axis=0)
+                - np.mean(v_neg / sigma_squared, axis=0)
+            )
+            grad_hb = (
+                np.mean(hidden_means[0], axis=0)
+                - np.mean(hidden_states_neg[0], axis=0)
+            )
+            delta_log_sigma = (
+                np.mean(((batch - rbm.visible_bias) ** 2) / sigma_squared - 1, axis=0)
+                - np.mean(((v_neg - rbm.visible_bias) ** 2) / sigma_squared - 1, axis=0)
+            )
+          else:
+            lower_h_pos = hidden_means[i - 1]
+            upper_h_pos = hidden_means[i]
+            lower_h_neg = hidden_states_neg[i - 1]
+            upper_h_neg = hidden_states_neg[i]
+            pos_assoc = (np.dot((lower_h_pos / sigma_squared).T, upper_h_pos) / bsz)
+            neg_assoc = (np.dot((lower_h_neg / sigma_squared).T, upper_h_neg) / bsz)
+            grad_w = pos_assoc - neg_assoc - weight_decay * rbm.weights
+            grad_vb = (
+                np.mean(lower_h_pos / sigma_squared, axis=0)
+                - np.mean(lower_h_neg / sigma_squared, axis=0)
+            )
+            grad_hb = (
+                np.mean(upper_h_pos, axis=0)
+                - np.mean(upper_h_neg, axis=0)
+            )
+            delta_log_sigma = np.zeros_like(rbm.log_sigma_squared)
 
-          rbm.weights += learning_rate * (pos_associations - neg_associations) / batch_size
-          rbm.visible_bias += learning_rate * np.mean((v_pos - v) / sigma_squared, axis=0)
-          rbm.hidden_bias += learning_rate * np.mean(h_pos - h_mean_neg, axis=0)
+          grad_w = np.clip(grad_w, -max_grad, max_grad)
+          grad_vb = np.clip(grad_vb, -max_grad, max_grad)
+          grad_hb = np.clip(grad_hb, -max_grad, max_grad)
+          delta_log_sigma = np.clip(delta_log_sigma, -max_grad, max_grad)
 
-          # Update log variance
-          pos_var_term = ((v_pos - rbm.visible_bias) ** 2) / sigma_squared
-          neg_var_term = ((v - rbm.visible_bias) ** 2) / sigma_squared
-          delta_log_sigma_squared = learning_rate * (np.mean(pos_var_term - 1, axis=0) - np.mean(neg_var_term - 1, axis=0))
-          rbm.log_sigma_squared += delta_log_sigma_squared
+          self.adam_buffers[i]['v_w'] = beta1 * self.adam_buffers[i]['v_w'] + (1 - beta1) * grad_w
+          self.adam_buffers[i]['v_vb'] = beta1 * self.adam_buffers[i]['v_vb'] + (1 - beta1) * grad_vb
+          self.adam_buffers[i]['v_hb'] = beta1 * self.adam_buffers[i]['v_hb'] + (1 - beta1) * grad_hb
+          self.adam_buffers[i]['v_log_sigma'] = beta1 * self.adam_buffers[i]['v_log_sigma'] + (
+                1 - beta1) * delta_log_sigma
 
-          min_log_sigma = -4  # Corresponds to variance ≈ 0.018
-          max_log_sigma = 4  # Corresponds to variance ≈ 54.6
-          rbm.log_sigma_squared = np.clip(rbm.log_sigma_squared, min_log_sigma, max_log_sigma)
+          self.adam_buffers[i]['s_w'] = beta2 * self.adam_buffers[i]['s_w'] + (1 - beta2) * (grad_w ** 2)
+          self.adam_buffers[i]['s_vb'] = beta2 * self.adam_buffers[i]['s_vb'] + (1 - beta2) * (grad_vb ** 2)
+          self.adam_buffers[i]['s_hb'] = beta2 * self.adam_buffers[i]['s_hb'] + (1 - beta2) * (grad_hb ** 2)
+          self.adam_buffers[i]['s_log_sigma'] = beta2 * self.adam_buffers[i]['s_log_sigma'] + (1 - beta2) * (
+                delta_log_sigma ** 2)
 
-          v = v_pos
+          m_w_hat = self.adam_buffers[i]['v_w'] / (1 - beta1 ** t)
+          v_w_hat = self.adam_buffers[i]['s_w'] / (1 - beta2 ** t)
+          m_vb_hat = self.adam_buffers[i]['v_vb'] / (1 - beta1 ** t)
+          v_vb_hat = self.adam_buffers[i]['s_vb'] / (1 - beta2 ** t)
+          m_hb_hat = self.adam_buffers[i]['v_hb'] / (1 - beta1 ** t)
+          v_hb_hat = self.adam_buffers[i]['s_hb'] / (1 - beta2 ** t)
+          m_log_hat = self.adam_buffers[i]['v_log_sigma'] / (1 - beta1 ** t)
+          v_log_hat = self.adam_buffers[i]['s_log_sigma'] / (1 - beta2 ** t)
 
-        error = np.mean((batch - v) ** 2)
-        batch_errors.append(error)
+          rbm.weights += -learning_rate * m_w_hat / (np.sqrt(v_w_hat) + epsilon)
+          rbm.visible_bias += -learning_rate * m_vb_hat / (np.sqrt(v_vb_hat) + epsilon)
+          rbm.hidden_bias += -learning_rate * m_hb_hat / (np.sqrt(v_hb_hat) + epsilon)
+          rbm.log_sigma_squared += -learning_rate * 0.5 * m_log_hat / (np.sqrt(v_log_hat) + epsilon)
 
-      print(f"Fine-tuning Epoch {epoch + 1}/{epochs}")
+        mse = np.mean((batch - v_neg) ** 2)
+        batch_errors.append(mse)
+
+      print(f"Fine-Tuning Epoch {epoch + 1}/{epochs}, MSE: {np.mean(batch_errors):.4f}")
 
   def forward_pass(self, data):
     input_data = data
@@ -163,18 +322,23 @@ class DBM:
     return input_data
 
   def reconstruct(self, data):
-    activations = [data]
-    v = data
+    """
+    Reconstruct data by going up (prob_h) then down (sample_visible)
+    through each layer in reverse.
+    """
+    # Up
+    hidden_samples = []
+    current = data
     for rbm in self.rbms:
-      h_mean, h_sample = rbm.sample_hidden(v)
-      activations.append(h_mean)
-      v = h_mean
+      _, h_samp = rbm.sample_hidden(current)
+      hidden_samples.append(h_samp)
+      current = h_samp
 
-    for idx in reversed(range(len(self.rbms))):
-      rbm = self.rbms[idx]
-      v = rbm.sample_visible(v)
-
-    return v
+    # Down
+    for i in reversed(range(len(self.rbms))):
+      rbm = self.rbms[i]
+      current = rbm.sample_visible(hidden_samples[i])
+    return current
 
 
 df = pd.read_csv('../interaction_data.csv')
@@ -184,6 +348,13 @@ df.fillna(0, inplace=True)
 
 interaction_df = df[['user_id', 'track_name']].drop_duplicates()
 interaction_df['interaction'] = 1
+
+artist_map = (
+  df[['track_name', 'artist_name']]
+  .drop_duplicates(subset='track_name')
+  .set_index('track_name')['artist_name']
+  .to_dict()
+)
 
 user_song_matrix = interaction_df.pivot(index='user_id', columns='track_name', values='interaction').fillna(0)
 
@@ -195,13 +366,28 @@ song_features_normalized = (song_features - song_features.mean()) / song_feature
 song_features_matrix = song_features_normalized.values
 
 num_visible = song_features_matrix.shape[1]
-num_epochs = 30
-learningRate = 0.001
+num_epochs = 100
+learningRate = 0.005
 weightDecay = 0.0005
 
-dbm = DBM([num_visible, 1024, 512, 256])
-dbm.pretrain_layers(song_features_matrix, learning_rate=learningRate, epochs=num_epochs, batch_size=128, weight_decay=weightDecay)
-dbm.finetune(song_features_matrix, learning_rate=learningRate, epochs=num_epochs, batch_size=128)
+dbm = DBM([num_visible, 16, 32, 64, 32, 16])
+
+dbm.pretrain_layers(song_features_matrix,
+                    learning_rate=learningRate,
+                    epochs=num_epochs,
+                    batch_size=128,
+                    weight_decay=weightDecay)
+
+dbm.finetune(song_features_matrix,
+             learning_rate=0.0001,
+             epochs=50,
+             batch_size=128,
+             mean_field_iters=3,
+             gibbs_k=3,
+             max_grad=3.0,
+             weight_decay=0.001,
+             beta1=0.9,
+             beta2=0.9)
 
 song_embeddings = dbm.reconstruct(song_features_matrix)
 song_embeddings_df = pd.DataFrame(song_embeddings, index=song_features_normalized.index)
@@ -221,9 +407,14 @@ def recommend_songs(user_id, user_preferences, songEmbeddings, userSongMatrix, t
   listened_songs = userSongMatrix.columns[userSongMatrix.loc[user_id] > 0]
   recommendations = similarity_series.drop(listened_songs, errors='ignore')
   top_recommendations = recommendations.sort_values(ascending=False).head(top_n)
-  return top_recommendations
+
+  recommendation_df = top_recommendations.reset_index()
+  recommendation_df.columns = ['track_name', 'similarity_score']
+  recommendation_df['artist_name'] = recommendation_df['track_name'].map(artist_map)
+  recommendation_df = recommendation_df[['track_name', 'artist_name', 'similarity_score']]
+  return recommendation_df
 
 user_to_recommend = "2edc5b296b0948cabc6dd754d0250e43"
-recommended_songs = recommend_songs(user_to_recommend, user_preferences_df, song_embeddings_df, user_song_matrix, top_n=10)
+recommended_songs = recommend_songs(user_to_recommend, user_preferences_df, song_embeddings_df, user_song_matrix, top_n=20)
 
 print(f"Top recommendations for {user_to_recommend}:\n{recommended_songs}")
