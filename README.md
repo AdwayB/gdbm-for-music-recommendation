@@ -54,18 +54,30 @@ The recommendation system uses a Gaussian-Bernoulli Deep Boltzmann Machine with 
 ### **Key Components**
 
 1. **Data Preparation**:
-   - The **interaction data** is converted into a **User-Song Matrix** (binary interactions) and a **Song Feature Matrix** for training.
+   - The interaction data is converted into a **User-Song Matrix** (binary interactions) and a **Song Feature Matrix** for training.
 
 2. **Gaussian-Bernoulli Deep Boltzmann Machine (DBM)**:
    - A stack of Gaussian-Bernoulli Restricted Boltzmann Machines (GRBMs) with progressively smaller layers.
    - Trained in two phases:
-     - **Pretraining**: Each layer learns independently, capturing hierarchical feature representations.
+     - **Pretraining**: Each layer learns independently, capturing hierarchical feature representations, which facilitates better performance during fine-tuning.
      - **Fine-Tuning**: The entire DBM is trained end-to-end to minimize reconstruction error.
 
-3. **User Preferences**:
+3. **Mean-Field Inference**:
+   - A parallel mean-field inference algorithm is used to approximate the posterior distribution of the hidden units given the visible data.
+   - The hidden states are used to sample the visible layer, which is then used to reconstruct the song embeddings.
+
+4. **Block Gibbs Sampling**:
+   - A parallel block Gibbs sampler is used to generate negative samples from the model distribution, which are used in the contrastive divergence step during fine-tuning.
+
+5. **Fine-Tuning Algorithm**:
+   - The contrastive divergence step computes gradients by contrasting positive associations from the data with negative associations from model-generated samples.
+   - Regularization methods such as weight decay and gradient clipping are applied to prevent exploding values, ensuring stable parameter updates.
+   - Uses the Adam optimization algorithm to adaptively adjust learning rates for each parameter, enhancing convergence efficiency and training stability.
+
+6. **User Preferences**:
    - Each user’s preference vector is computed as the mean embedding of the songs they interacted with.
 
-4. **Recommendation Generation**:
+7. **Recommendation Generation**:
    - Cosine similarity is calculated between a user’s preference vector and all song embeddings.
    - Songs already listened to by the user are excluded.
    - The top `N` most similar songs are returned as recommendations.
