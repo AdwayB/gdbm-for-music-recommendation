@@ -383,11 +383,11 @@ dbm.finetune(song_features_matrix,
              epochs=50,
              batch_size=128,
              mean_field_iters=3,
-             gibbs_k=3,
-             max_grad=3.0,
+             gibbs_k=7,
+             max_grad=2.0,
              weight_decay=0.001,
              beta1=0.9,
-             beta2=0.9)
+             beta2=0.999)
 
 song_embeddings = dbm.reconstruct(song_features_matrix)
 song_embeddings_df = pd.DataFrame(song_embeddings, index=song_features_normalized.index)
@@ -399,6 +399,33 @@ for userId, songs_list in user_listened_songs.items():
     user_preference_vectors[userId] = embeddings.mean(axis=0)
 
 user_preferences_df = pd.DataFrame(user_preference_vectors).T
+
+
+def generate_all_recommendations(preferences_df, embeddings_df, user_listened_matrix, top_n=10):
+  """
+  Generate top-N recommendations for all users.
+
+  Parameters:
+      preferences_df (pd.DataFrame): DataFrame where each row represents a user's preference vector.
+      embeddings_df (pd.DataFrame): DataFrame where each row represents a song's embedding.
+      user_listened_matrix (pd.DataFrame): DataFrame indicating user-song interactions.
+      top_n (int): Number of top recommendations to generate per user.
+
+  Returns:
+      recommendations (dict): Dictionary mapping user_id to a list of recommended song names.
+  """
+  recommendations = {}
+  for user_id, user_vector in preferences_df.iterrows():
+    similarities = cosine_similarity(user_vector.values.reshape(1, -1), embeddings_df.values)[0]
+    similarity_series = pd.Series(similarities, index=embeddings_df.index)
+
+    listened_songs = user_listened_matrix.columns[user_song_matrix.loc[user_id] > 0]
+    similarity_series = similarity_series.drop(listened_songs, errors='ignore')
+
+    top_recommendations = similarity_series.sort_values(ascending=False).head(top_n)
+    recommendations[user_id] = top_recommendations.index.tolist()
+
+  return recommendations
 
 def recommend_songs(user_id, user_preferences, songEmbeddings, userSongMatrix, top_n=10):
   user_vector = user_preferences.loc[user_id].values.reshape(1, -1)
@@ -414,7 +441,48 @@ def recommend_songs(user_id, user_preferences, songEmbeddings, userSongMatrix, t
   recommendation_df = recommendation_df[['track_name', 'artist_name', 'similarity_score']]
   return recommendation_df
 
+def evaluate_diversity(preferences_df, user_listened_matrix, top_n=10):
+  diversity_scores = []
+  song_similarity_matrix = cosine_similarity(song_embeddings_df.values)
+  song_similarity_df = pd.DataFrame(song_similarity_matrix, index=song_embeddings_df.index,
+                                    columns=song_embeddings_df.index)
+
+  for user_id in preferences_df.index:
+    recommended = recommend_songs(user_id, preferences_df, song_embeddings_df, user_listened_matrix, top_n=top_n)[
+      'track_name']
+    if len(recommended) < 2:
+      continue
+    pairwise_similarities = []
+    for i in range(len(recommended)):
+      for j in range(i + 1, len(recommended)):
+        sim = song_similarity_df.loc[recommended[i], recommended[j]]
+        pairwise_similarities.append(sim)
+    avg_similarity = np.mean(pairwise_similarities)
+    diversity = 1 - avg_similarity
+    diversity_scores.append(diversity)
+
+  avg_diversity = np.mean(diversity_scores)
+  print(f"Average Diversity@{top_n}: {avg_diversity:.4f}")
+  return avg_diversity
+
+def evaluate_coverage(preferences_df, user_listened_matrix, top_n=10):
+  all_recommended = set()
+  for user_id in preferences_df.index:
+    recommended = recommend_songs(user_id, preferences_df, song_embeddings_df, user_listened_matrix, top_n=top_n)[
+      'track_name']
+    all_recommended.update(recommended)
+  total_songs = song_embeddings_df.shape[0]
+  coverage = len(all_recommended) / total_songs
+  print(f"Coverage@{top_n}: {coverage:.4f}")
+  return coverage
+
 user_to_recommend = "2edc5b296b0948cabc6dd754d0250e43"
 recommended_songs = recommend_songs(user_to_recommend, user_preferences_df, song_embeddings_df, user_song_matrix, top_n=20)
 
 print(f"Top recommendations for {user_to_recommend}:\n{recommended_songs}")
+
+evaluate_diversity(user_preferences_df, user_song_matrix, top_n=10)
+evaluate_coverage(user_preferences_df, user_song_matrix, top_n=10)
+
+recommendations_dict = pd.DataFrame(generate_all_recommendations(user_preferences_df, song_embeddings_df, user_song_matrix, top_n=10))
+print(f"Top recommendations for all users:\n{recommendations_dict}")
